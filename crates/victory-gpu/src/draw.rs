@@ -823,11 +823,12 @@ impl State {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
                         describe(crate::descriptor::view(handle).as_ref())
                     }
+                    (RootType::Descriptor, bound) => describe_root_view(bound),
                     (root, _) => format!("{root:?}"),
                 };
                 out.push(format!(
-                    "{} {:?} s{}+{}: {what}",
-                    stage.shader.hash, u.kind, u.slot, u.table_offset_dwords
+                    "{} {} {:?} s{}+{}: {what}",
+                    stage.shader.stage, stage.shader.hash, u.kind, u.slot, u.table_offset_dwords
                 ));
             }
         }
@@ -1185,6 +1186,44 @@ fn describe(view: Option<&View>) -> String {
             format!("Constant({address:#x}, {size}) {v:?}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
+    }
+}
+
+/// Reports the guest argument before host binding.
+#[cfg(feature = "diagnostics")]
+fn describe_root_view(bound: Option<&Root>) -> String {
+    match bound {
+        Some(Root::View(address)) => format!("Descriptor(guest address {address:#x})"),
+        Some(Root::Table(_)) => "Descriptor(table supplied)".into(),
+        Some(Root::Constants(_)) => "Descriptor(constants supplied)".into(),
+        Some(Root::None) | None => "Descriptor(unset)".into(),
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn root_view_trace_distinguishes_zero_unset_and_wrong_argument_kinds() {
+        assert_eq!(describe_root_view(None), "Descriptor(unset)");
+        assert_eq!(describe_root_view(Some(&Root::None)), "Descriptor(unset)");
+        assert_eq!(
+            describe_root_view(Some(&Root::View(0))),
+            "Descriptor(guest address 0x0)"
+        );
+        assert_eq!(
+            describe_root_view(Some(&Root::View(42))),
+            "Descriptor(guest address 0x2a)"
+        );
+        assert_eq!(
+            describe_root_view(Some(&Root::Table(42))),
+            "Descriptor(table supplied)"
+        );
+        assert_eq!(
+            describe_root_view(Some(&Root::Constants(vec![42]))),
+            "Descriptor(constants supplied)"
+        );
     }
 }
 
