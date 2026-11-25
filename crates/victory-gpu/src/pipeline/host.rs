@@ -222,6 +222,37 @@ impl GraphicsState {
         }
     }
 
+    /// The blend state for the host: blending off on the render targets
+    /// whose format cannot blend (integer formats). The console ignores
+    /// blending there; D3D12 refuses the whole pipeline (debug layer 676,
+    /// "this format does not support blending"), and every draw of it is
+    /// dropped. With one blend description for all targets, it is copied
+    /// to each first so that only those targets change.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let n = self.targets.NumRenderTargets.min(8) as usize;
+        let independent = blend.IndependentBlendEnable.as_bool();
+        let fix: Vec<usize> = (0..n)
+            .filter(|&i| integer_format(self.targets.RTFormats[i]))
+            .filter(|&i| {
+                blend.RenderTarget[if independent { i } else { 0 }]
+                    .BlendEnable
+                    .as_bool()
+            })
+            .collect();
+        if fix.is_empty() {
+            return blend;
+        }
+        if !independent {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in fix {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -634,7 +665,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -852,6 +883,35 @@ fn graphics_depth_bounds_pipeline(
 /// "already exists"). The translation makes triangle mesh shaders only
 /// (`mesh_prologue` refuses others), and the debug layer wants the two to
 /// agree (1323).
+/// Whether a render target format is an integer one (`_UINT`, `_SINT`):
+/// D3D12 blends none of them.
+fn integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -881,7 +941,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +960,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -976,6 +1036,58 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+    fn blending(targets: &[DXGI_FORMAT], independent: bool) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        for t in &mut g.blend.RenderTarget {
+            t.BlendEnable = true.into();
+            t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        }
+        g.targets.NumRenderTargets = targets.len() as u32;
+        g.targets.RTFormats[..targets.len()].copy_from_slice(targets);
+        g
+    }
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let formats = [
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R32_SINT,
+        ];
+        for independent in [false, true] {
+            let b = blending(&formats, independent).host_blend();
+            assert!(b.IndependentBlendEnable.as_bool());
+            let on: Vec<bool> = (0..4)
+                .map(|i| b.RenderTarget[i].BlendEnable.as_bool())
+                .collect();
+            assert_eq!(on, [true, true, false, false], "independent {independent}");
+            // Everything else of the shared description is kept.
+            assert!((0..4).all(|i| b.RenderTarget[i].SrcBlend == D3D12_BLEND_SRC_ALPHA));
+        }
+    }
+
+    #[test]
+    fn float_targets_keep_the_title_blend() {
+        let g = blending(
+            &[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT],
+            false,
+        );
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn integer_targets_without_blending_are_unchanged() {
+        let mut g = blending(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT], true);
+        g.blend.RenderTarget[1].BlendEnable = false.into();
+        let b = g.host_blend();
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[1].BlendEnable.as_bool());
+    }
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
@@ -1115,7 +1227,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,

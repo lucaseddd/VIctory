@@ -231,3 +231,15 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     );
     Ok(all)
 }
+
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 620;
+
+#[repr(transparent)]
+pub struct SdkPath(*const u8);
+
+// The pointer permanently refers to immutable static bytes.
+unsafe impl Sync for SdkPath {}
+
+#[unsafe(no_mangle)]
+pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr().cast());
